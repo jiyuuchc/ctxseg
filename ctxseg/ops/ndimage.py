@@ -1,0 +1,68 @@
+from functools import partial
+import jax
+from jax import Array
+from jax.typing import ArrayLike
+
+jnp = jax.numpy
+
+def _retrieve_value_at(img, loc, out_of_bound_value=0):
+
+    iloc = jnp.floor(loc).astype(int)
+    res = loc - iloc
+
+    offsets = jnp.asarray(
+        [[(i >> j) % 2 for j in range(len(loc))] for i in range(2 ** len(loc))]
+    )
+    ilocs = jnp.swapaxes(iloc + offsets, 0, 1)
+
+    weight = jnp.prod(res * (offsets == 1) + (1 - res) * (offsets == 0), axis=1)
+
+    max_indices = jnp.asarray(img.shape)[: len(loc), None]
+    values = jnp.where(
+        (ilocs >= 0).all(axis=0) & (ilocs < max_indices).all(axis=0),
+        jnp.swapaxes(img[tuple(ilocs)], 0, -1),
+        out_of_bound_value,
+    )
+
+    value = (values * weight).sum(axis=-1)
+
+    return value
+
+
+def sub_pixel_samples(
+    img: ArrayLike,
+    locs: ArrayLike,
+    out_of_bound_value: float = 0,
+    edge_indexing: bool = False,
+) -> Array:
+    """Retrieve image values as non-integer locations by interpolation
+
+    Args:
+        img: Array of shape [D1,D2,..,Dk, ...]
+        locs: Array of shape [d1,d2,..,dn, k]
+        out_of_bound_value: optional float constant, defualt 0.
+        edge_indexing: if True, the index for the top/left pixel is 0.5, otherwise 0. Default is False
+
+    Returns:
+        values: [d1,d2,..,dn, ...], float
+    """
+
+    loc_shape = locs.shape
+    img_shape = img.shape
+    d_loc = loc_shape[-1]
+    locs = jnp.asarray(locs)
+    img = jnp.asarray(img)
+
+    if edge_indexing:
+        locs = locs - 0.5
+
+    img = img.reshape(img_shape[:d_loc] + (-1,))
+    locs = locs.reshape(-1, d_loc)
+    op = partial(_retrieve_value_at, out_of_bound_value=out_of_bound_value)
+
+    values = jax.vmap(op, in_axes=(None, 0))(img, locs)
+    out_shape = loc_shape[:-1] + img_shape[d_loc:]
+
+    values = values.reshape(out_shape)
+
+    return values
