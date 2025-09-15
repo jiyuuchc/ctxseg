@@ -42,7 +42,7 @@ def linear_attn(q, k, v, mask, temp):
 
 
 class CtxAtt(nnx.Module):
-    def __init__(self, num_heads, in_dim, k_dim=None, v_dim=None, hidden_dim=None, use_bias=False, att_type="sigmoid", *, rngs=nnx.Rngs(0), dtype=None):
+    def __init__(self, num_heads, in_dim, k_dim=None, v_dim=None, hidden_dim=None, use_bias=True, att_type="sigmoid", *, rngs=nnx.Rngs(0), dtype=None):
         dargs = dict(dtype=dtype, rngs=rngs)
         hidden_dim = hidden_dim or in_dim
         assert hidden_dim % num_heads == 0, f"hidden_dim {hidden_dim} should be divisible by num_heads {num_heads}"
@@ -64,21 +64,40 @@ class CtxAtt(nnx.Module):
 
     def __call__(self, q, k=None, v=None, mask=None):
         B, R, C = q.shape[:3]
+        if mask is not None:
+            mask = jax.image.resize(mask, (B, R, C), method='nearest')
+            mask = rearrange(mask, 'B R C -> B 1 1 (R C)')
+
+        shortcut = q
 
         k = q if k is None else k
         v = q if v is None else v
         q = rearrange(self.proj_q(q), 'B R C (H D) -> B H (R C) D', H=self.num_heads)
         k = rearrange(self.proj_k(k), 'B R C (H D) -> B H (R C) D', H=self.num_heads)
         v = rearrange(self.proj_v(v), 'B R C (H D) -> B H (R C) D', H=self.num_heads)
-        if mask is not None:
-            mask = rearrange(mask, 'B R C -> B 1 1 (R C)')
 
         x = self.att_fn(q, k, v, mask, self.temp)
 
         x = rearrange(x, "B H (R C) D -> B R C (H D)", R=R, C=C) 
-        x = self.proj_out(x)
+
+        x = self.proj_out(x) + shortcut
 
         return x
+
+    def batch_process(self, q, k, v, mask=None):
+        n_refs = k.shape[0]
+        B = q.shape[0]
+        q = repeat(q, 'B ... -> (B N) ...', N=n_refs)
+        k = repeat(k, 'N ... -> (B N) ...', B=B)
+        v = repeat(v, 'N ... -> (B N) ...', B=B)
+        if mask is not None:
+            mask = repeat(mask, 'N ... -> (B N) ...', B=B)
+
+        x = self(q, k, v, mask)
+
+        x = rearrange(x, '(B N) ... -> B N ...', B=B).mean(axis=1)
+
+        return x 
 
 
 class CtxSegP(nnx.Module):
@@ -215,37 +234,49 @@ class CtxSegP(nnx.Module):
 
 
 class CtxSegD(nnx.Module):
-    def __init__(self, *, rngs=nnx.Rngs(0), dtype=None):
-        self.encoder = ConvNeXt(rngs=rngs, dtype=dtype)
-        self.ref_encoder = ConvNeXt(model_dim=64, in_dim=2, rngs=rngs, dtype=dtype)
-        self.decoder = ConvDecoder(3, patch_size=4, model_dim=128, depths=(2,2,2,1), dim_multi=(4,4,4,8), skip_multi=(1,2,4,8), rngs=rngs, dtype=dtype)
+    def __init__(self, *, ps=4, rngs=nnx.Rngs(0), dtype=None):
+        self.encoder = ConvNeXt(patch_size=ps, rngs=rngs, dtype=dtype)
+        self.ref_encoder = ConvNeXt(patch_size=ps, model_dim=64, in_dim=2, rngs=rngs, dtype=dtype)
+        self.decoder = ConvDecoder(3, patch_size=ps, model_dim=128, depths=(2,2,2,1), dim_multi=(4,4,4,8), skip_multi=(1,2,4,8), rngs=rngs, dtype=dtype)
         self.atts = []
         for k in range(4):
-            dim = 128 * (2 ** k)
-            self.atts.append(CtxAtt(dim // 128, dim, dim, dim // 2, att_type="linear" if k<2 else "sigmoid", rngs=rngs))
+            q_dim = 128 * (8 if k==3 else 4)
+            kv_dim = 192 * (2 ** k)
+            self.atts.append(CtxAtt(q_dim // 128, q_dim, kv_dim, kv_dim, att_type="linear" if k<2 else "sigmoid", rngs=rngs))
 
 
     def __call__(self, image, ref_image=None, ref_flow=None, ref_mask=None):
-        x = self.encoder(image)
+        skips = self.encoder(image)
 
         if ref_image is not None:
+            assert ref_flow is not None
             x_ref = self.encoder(ref_image)
             y_ref = self.ref_encoder(ref_flow)
-            for k, att in enumerate(self.atts):
-                if ref_mask is not None:
-                    mask = jax.image.resize(ref_mask, x_ref[k].shape[:3], 'nearest')
-                else:
-                    mask = None
-                x[k] += att(x[k], x_ref[k], y_ref[k], mask)
-        
-        return self.decoder(x)
 
+        x = 0.
+        for k in reversed(range(len(skips))):
+            module = self.decoder.layers[k]
+
+            x = x + module.skip_proj(skips.pop())
+            if ref_image is not None:
+                q = jnp.c_[x_ref[k], y_ref[k]]
+                x = self.atts[k](x, q, q, ref_mask)
+
+            for block in module.blocks:
+                x = block(x) 
+            
+            x = module.up(module.norm(x))
+
+        assert len(skips) == 0
+
+        return x
 
     @nnx.jit
     def set_ref(self, ref_image=None, ref_flow=None, ref_mask=None):
         if ref_image is None:
             self.x_ref = self.y_ref = None
         else:
+            assert ref_flow is not None
             self.x_ref = self.encoder(ref_image)
             self.y_ref = self.ref_encoder(ref_flow)
         self.ref_mask = ref_mask
@@ -258,28 +289,25 @@ class CtxSegD(nnx.Module):
             x_ref = self.x_ref
             y_ref = self.y_ref
         except:
-            ref_mask, x_ref, y_ref = None, None, None
+            ref_mask = None
+            x_ref = y_ref = None
 
-        B = image.shape[0]
-        x = self.encoder(image)
+        skips = self.encoder(image)
 
-        if x_ref is not None:
-            n_refs = x_ref[0].shape[0]
+        x = 0.
+        for k in reversed(range(len(skips))):
+            module = self.decoder.layers[k]
+            x = x + module.skip_proj(skips.pop())
+            if x_ref is not None:
+                assert y_ref is not None
+                q = jnp.c_[x_ref[k], y_ref[k]]
+                x = self.atts[k].batch_process(x, q, q, ref_mask)
 
-            for k, att in enumerate(self.atts):
-                if ref_mask is not None:
-                    mask = jax.image.resize(ref_mask, x_ref[k].shape[:-1], 'nearest')
-                    mask = repeat(mask, 'N ... -> (B N) ...', B=B)
-                else:
-                    mask = None
+            for block in module.blocks:
+                x = block(x)
 
-                x_ = repeat(x[k], 'B ... -> (B N) ...', N=n_refs)
-                x_ref_ = repeat(x_ref[k], 'N ... -> (B N) ...', B=B)
-                y_ref_ = repeat(y_ref[k], 'N ... -> (B N) ...', B=B)
+            x = module.up(module.norm(x))
 
-                y_ = att(x_, x_ref_, y_ref_, mask)
-                y_ = rearrange(y_, '(B N) ... -> B N ...', N = n_refs)
-                x[k] += y_.mean(axis=1)
-        
-        return self.decoder(x)
+        assert len(skips) == 0
 
+        return x

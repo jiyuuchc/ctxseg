@@ -3,6 +3,8 @@ from typing import Sequence, Any
 import jax
 from flax import nnx
 from einops import rearrange
+from .convnext import ConvNeXt
+
 jnp = jax.numpy
 
 def edm_precond(model_fn, *, sigma_data=0.5):
@@ -233,3 +235,43 @@ class UNetUp(nnx.Module):
 
         return x
 
+
+class SegP(nnx.Module):
+    def __init__(self, model_dim=128, patch_size=4, depths=(2,2,2,2), dim_multi=(1,2,4,8), *, rngs=nnx.Rngs(0),  dtype=None):
+        self.label_emb = LabelEmbedding(model_dim, endpoint=True, rngs=rngs, dtype=dtype)
+        self.x_encoder = ConvNeXt(model_dim=model_dim, patch_size=patch_size, rngs=rngs, dtype=dtype)
+        self.y_encoder = UNetDown(
+            in_dim=2, patch_size=patch_size, model_dim=model_dim, emb_dim=model_dim,
+            depths=depths, dim_multi=dim_multi, att_levels=(2,3),
+            rngs=rngs, dtype=dtype)
+        self.decoder = UNetUp(
+            out_dim=2, patch_size=patch_size, model_dim=model_dim, emb_dim=model_dim,
+            depths=depths, dim_multi=dim_multi, att_levels=(2,3), cond_dim=model_dim,
+            rngs=rngs, dtype=dtype)
+
+
+    def __call__(self, x_t, noise_labels, *, image):
+        emb = self.label_emb(noise_labels)
+
+        x_skips = self.x_encoder(image)
+        y_skips = self.y_encoder(x_t, emb)
+
+        out = self.decoder(y_skips, emb, conds=x_skips)
+
+        return out
+
+
+    @nnx.jit
+    def set_image(self, image):
+        x_skips = self.x_encoder(image)
+        self.x_skips = x_skips
+
+
+    @nnx.jit
+    def predict(self, x_t, noise_labels):
+        emb = self.label_emb(noise_labels)
+        y_skips = self.y_encoder(x_t, emb)
+
+        out = self.decoder(y_skips, emb, conds=self.x_skips)
+
+        return out

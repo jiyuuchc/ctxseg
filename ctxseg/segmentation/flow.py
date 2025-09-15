@@ -257,3 +257,18 @@ def flow_to_mask(dP, niter=200, *, min_seed_cnts=10):
 
     return mask
 
+
+def correct_flow_err(flow, mask=None, max_err = 0.25):
+    from skimage.measure import regionprops
+    if max_err > 0:
+        if mask is None:
+            mask = flow_to_mask(flow, niter=1000)
+        mask = mask.astype(int)
+        flow_err = ((mask_to_flow(mask) - flow) ** 2).mean(axis=-1)
+        bad_cells = []
+        for rp in regionprops(mask, flow_err):
+            if rp.intensity_mean > max_err:
+                bad_cells.append(rp.label)
+        mask[np.isin(mask, bad_cells)] = 0
+    
+    return mask

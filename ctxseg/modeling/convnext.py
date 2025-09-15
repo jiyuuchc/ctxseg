@@ -158,3 +158,19 @@ class ConvNeXt(nnx.Module):
             skips = self.decoder(skips)
         
         return skips
+
+
+class SegD(nnx.Module):
+    def __init__(self, *, ps=4, rngs=nnx.Rngs(0), dtype=None):
+        self.encoder = ConvNeXt(patch_size=ps, rngs=rngs, dtype=dtype)
+        self.decoder = ConvDecoder(3, patch_size=ps, model_dim=128, depths=(2,2,2,1), dim_multi=(4,4,4,8), skip_multi=(1,2,4,8), rngs=rngs, dtype=dtype)
+
+    def __call__(self, image):
+        skips = self.encoder(image)
+        y = self.decoder(skips)
+
+        return y
+
+    @nnx.jit
+    def predict(self, image):
+        return self(image)

@@ -62,7 +62,7 @@ def edm_hat_schedule(key, x, *, sigma_data=0.5, sigma_min=0.002, sigma_max=80, p
     return sigma_hat, loss_weight
 
 
-def ncsn2_schedule(key, x, *, sigma_min=0.01, sigma_max=5000):
+def ncsn2_schedule(key, x, *, sigma_min=0.01, sigma_max=80):
     """ Modeled after the NCSN2 schedule as described in https://arxiv.org/abs/2006.09011
     This is an ELBO schedule due to effective constant loss weight. It also uses the low
     discrenpancy sampling described in https://arxiv.org/abs/2107.00630.
