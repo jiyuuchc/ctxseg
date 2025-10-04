@@ -1,5 +1,7 @@
 """ Jax implementation of flow and inverse-flow operator originally used by cellpose
 """
+from functools import partial
+
 import jax
 import numpy as np
 import scipy
@@ -223,52 +225,65 @@ def get_mask(p, niter=5, *, min_seed_cnts=10):
     return mask
 
 
-def flow_to_mask(dP, niter=200, *, min_seed_cnts=10):
+def flow_to_mask(
+        dP, niter:int=200,
+        *,
+        threshold:float=0.,
+        max_flow_err:float=0.,
+        min_seed_cnts:int=10,
+    ) -> np.ndarray:
     """ Convert flow field to mask.
     Args:
         dP: flow field. 
             Either batched input :(B, H, W, 2) or (B, D, H, W, 3)
             or unbatched: (H, W, 2) or (D, H, W, 3)
         niter: number of iterations to follow the flow.
+        threshod: minimum flow magnitude to be considered foreground.
+        max_flow_err: maximum flow error to be considered valid (0: no filtering).
+        min_seed_cnts: minimum number of pixels for a cell seed.
     Returns:
         mask: (B, H, W) or (B, D, H, W) for batched input. (H, W) 
             or (D, H, W) for unbatched input
     """
     D = dP.shape[-1]
+    ndim = dP.ndim
+
     assert D == 2 or D == 3, f"flow field dimsion must be 2/3, got {D}"
 
-    if dP.ndim == D + 1: # unbatched
-        p = follow_flows(dP / 5, niter=niter)
+    if ndim == D + 1: # unbatched
+        dP = dP[None]
 
-        mask = get_mask(p, min_seed_cnts=min_seed_cnts)
+    assert dP.ndim == D + 2, f"ilegal flow filed shape {dP.shape}"
 
-    else: # batched
-        from functools import partial
+    ps = jax.vmap(partial(follow_flows, niter=niter))(dP / 5)
 
-        assert dP.ndim == D + 2, f"ilegal flow filed shape {dP.shape}"
+    mask = [ get_mask(p, min_seed_cnts=min_seed_cnts) for p in ps ]
 
-        ps = jax.vmap(partial(follow_flows, niter=niter))(
-            dP / 5
-        )
-        mask = np.stack([
-            get_mask(p, min_seed_cnts=min_seed_cnts)
-            for p in ps
-        ])
+    if max_flow_err > 0:
+        mask = [ correct_flow_err(f, m, max_flow_err) for f, m in zip(dP, mask) ]
+
+    mask = np.stack(mask) if ndim == D + 2 else mask[0]
+
+    if threshold > 0:
+        from skimage.morphology import remove_small_holes
+        fg = (dP**2).sum(axis=-1) > threshold
+        fg = remove_small_holes(fg, area_threshold=64)
+        mask = np.where(fg, mask, 0)
 
     return mask
 
 
-def correct_flow_err(flow, mask=None, max_err = 0.25):
+def correct_flow_err(flow, mask, max_err = 0.25):
     from skimage.measure import regionprops
+
     if max_err > 0:
-        if mask is None:
-            mask = flow_to_mask(flow, niter=1000)
         mask = mask.astype(int)
         flow_err = ((mask_to_flow(mask) - flow) ** 2).mean(axis=-1)
         bad_cells = []
         for rp in regionprops(mask, flow_err):
             if rp.intensity_mean > max_err:
                 bad_cells.append(rp.label)
+
         mask[np.isin(mask, bad_cells)] = 0
     
     return mask
