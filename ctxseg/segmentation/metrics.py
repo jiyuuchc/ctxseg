@@ -175,8 +175,9 @@ class LabelMetrics:
 class MultiLabelMetrics:
     def __init__(self, n, *args, **kwargs):
         self.metrics = [LabelMetrics(*args, **kwargs) for _ in range(n)]
+        self.sample_ids = []
 
-    def update(self, pred_masks, gt_mask):
+    def update(self, pred_masks, gt_mask, *, sample_id=None):
         gt_mask, gt_areas, gt_bboxes = _analyze_mask(gt_mask)
         if gt_bboxes.shape[0] > 0:
             gt_bms = [gt_mask[box[0]:box[2], box[1]:box[3]] == gid + 1 for gid, box in enumerate(gt_bboxes)]
@@ -204,6 +205,8 @@ class MultiLabelMetrics:
             metric.gt_scores.append(gt_scores)
             metric.ious.append(ious)
 
+        self.sample_ids.append(sample_id)
+
 
     def compute(self, iou_threshold=.5, micros=False):
         import jax
@@ -216,6 +219,7 @@ class MultiLabelMetrics:
                 mi = jax.tree.map(lambda *x: x, *mi)
                 df_ = pd.DataFrame.from_dict(mi)
                 df_['sample'] = i
+                df_['image_id'] = self.sample_ids
                 if df is not None:
                     df = pd.concat([df, df_], axis = 0)
                 else:
