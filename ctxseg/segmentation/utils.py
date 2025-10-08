@@ -17,7 +17,10 @@ def remove_small_instances(mask, min_area=0):
 def clean_up_mask(mask):
     """ ensure continuity of mask ID"""
     unique_ids = np.unique(mask)
-    lut = np.zeros(unique_ids.max()+1, dtype=int)
+
+    assert np.all(unique_ids >= 0), f"Mask containes negative values."
+
+    lut = np.zeros(unique_ids.max()+1, dtype=mask.dtype)
     lut[unique_ids] = np.arange(len(unique_ids))
 
     return lut[mask]
