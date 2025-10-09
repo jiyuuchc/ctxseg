@@ -122,6 +122,7 @@ class CtxSegP(nnx.Module):
                 for _ in range(depths[k] + 1)
             ])
 
+        self.set_ref()
 
     def __call__(self, x_t, noise_labels, *, image, image_ref=None, flow_ref=None, ref_mask=None):
         emb = self.label_emb(noise_labels)

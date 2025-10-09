@@ -81,8 +81,12 @@ def ncsn2_schedule(key, x, *, sigma_min=0.01, sigma_max=80):
 
 
 def Precond(cls=None, *, schedule_fn="edm", kind="edm", **cond_kwargs):
-    """ Use this as a class decorator. Created a preconditioned diffusion model.
-    Also provids a self.train() function, which returns 
+    """ Use this as a class decorator. Creates a preconditioned diffusion model with a 
+    specific training schedule. Also provids a loss method, which returns weighted L2 loss
+
+    Keyword Args:
+        schedule_fn: string or callable. Training schedule.
+        **cond_kwargs: additional keyword args passed to the edm conditioner
     """
     schedule_fn_dict = {
         "edm": edm_schedule,
