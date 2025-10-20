@@ -130,36 +130,121 @@ def mask_to_flow(mask: np.ndarray) -> np.ndarray:
         raise ValueError("masks_to_flows only takes 2D or 3D arrays")
 
 
-def follow_flows(dP, niter=200):
+def _follow_flows(dP, niter=200):
     """ Follow flow field to get new pixel positions.
     Args:
-        dP: (H, W, 2/3) flow field.
+        dP: (H, W, 2) or (D, H, W, 3) flow field.
         niter: number of iterations to follow the flow.
     Returns:
-        p: (H, W, 2/3) array of new pixel positions after following the flow
+        p: (H, W, 2) or (D, H, W, 3) uint32 array of pixel positions after following the flow
     """
     d = dP.shape[-1]
     
-    assert (d == 2 or d == 3) and dP.ndim == d + 1, "dP must be with shape (H, W, 2) or (D, H, W, 2)"
+    assert (d == 2 or d == 3) and dP.ndim == d + 1, "dP must be with shape (H, W, 2) or (D, H, W, 3)"
 
     if d == 2:
         H, W, _ = dP.shape
-        p = np.stack(np.mgrid[:H, :W], axis=-1).astype(float)
-        max_values = jnp.array([H-1, W-1])
+        p = jnp.stack(jnp.mgrid[:H, :W], axis=-1).astype(float)
+        max_values = jnp.array([H, W])
     else:
         D, H, W, _ = dP.shape
-        p = np.stack(np.mgrid[:D, :H, :W], axis=-1).astype(float)
-        max_values = jnp.array([D-1, H-1, W-1])
+        p = jnp.stack(jnp.mgrid[:D, :H, :W], axis=-1).astype(float)
+        max_values = jnp.array([D, H, W])
 
     def _flow(_p, _):
-        dPt = sub_pixel_samples(dP, _p)
+        dPt = sub_pixel_samples(dP, _p, edge_indexing=True)
         _p += jnp.clip(dPt, -1, 1)
-        _p = jnp.clip(_p, 0, max_values)
+        _p = jnp.clip(_p, 0, max_values-0.001)
         return _p, None
 
-    p, _ = jax.lax.scan(_flow, p, length=niter)
+    p, _ = jax.lax.scan(_flow, p + .5, length=niter)
+
+    # p = jnp.clip(p, 0, max_values).astype('uint32')
 
     return p
+
+
+def _count_flow(p):
+    img_shape = jnp.array(p.shape[:-1])
+    p = p.astype('uint32')
+
+    cnts = (
+        jnp.zeros(img_shape, dtype='uint32')
+        .at[tuple(jnp.moveaxis(p, -1, 0))]
+        .add(1)
+    )
+    
+    return p, cnts
+
+
+def _get_seeds(cnts, *, window_size=5, min_seed_cnts=30):
+    dim = cnts.ndim
+    window_size = (window_size,) * dim
+    strides = (1,) * dim
+
+    th = jax.lax.reduce_window(cnts, jnp.array(min_seed_cnts, cnts.dtype), jax.lax.max, window_size, strides, 'same')
+    seed = jnp.where(
+        cnts >= th,
+        jnp.arange(cnts.size, dtype='uint32').reshape(cnts.shape) + 1,
+        0
+    )
+    seed = jax.lax.reduce_window(seed, jnp.array(0, seed.dtype), jax.lax.max, window_size, strides, 'same')
+    seed = jnp.where(
+        cnts >= min_seed_cnts,
+        seed,
+        0,
+    )
+    return seed
+
+
+def _expand_seed(cnts, seed, *, repeats=5, min_cnts=5):
+    dim = cnts.ndim
+    filter_fn = lambda x: jax.lax.reduce_window(
+        x, 
+        jnp.array(0, x.dtype), 
+        jax.lax.max, 
+        (3,) * dim, 
+        (1,) * dim, 
+        'same',
+    )
+
+    def _inner(carry, _):
+        carry = jnp.where(
+            (cnts >= min_cnts) & (carry == 0),
+            filter_fn(carry), carry,
+        )
+        return carry, None
+
+    seed, _ = jax.lax.scan(_inner, seed, length=repeats)
+    
+    return seed
+
+
+def _flow_to_mask(flow, *, niter=200, step_size=0.5, window_size=5, min_seed_cnts=30, expand_repeats=5, expand_min_cnts=5):
+    """ Convert flow field to mask.
+    Args:
+        flow: (H, W, 2) or (D, H, W, 3) flow field.
+    Keyword Args:
+        niter: number of iterations to follow the flow.
+        step_size: step size to follow the flow.
+        window_size: window size to get local maxima for seed points.
+        min_seed_cnts: minimum number of pixels for a cell seed.
+        expand_repeats: number of iterations to expand the seed points.
+        expand_min_cnts: minimum number of pixels to expand the seed points.
+    Returns:
+        mask: (H, W) or (D, H, W) label mask
+    """
+    p = _follow_flows(flow * step_size, niter=niter)
+
+    p, cnts = _count_flow(p)
+
+    seed = _get_seeds(cnts, window_size=window_size, min_seed_cnts=min_seed_cnts)
+
+    seed = _expand_seed(cnts, seed, repeats=expand_repeats, min_cnts=expand_min_cnts)
+
+    mask = seed[tuple(jnp.moveaxis(p, -1, 0))]
+
+    return mask
 
 
 def get_mask(p, niter=5, *, min_seed_cnts=10):
@@ -199,7 +284,6 @@ def get_mask(p, niter=5, *, min_seed_cnts=10):
     max_filterd_cnts = maximum_filter(p_cnts, size=5)
     seeds = np.where((p_cnts > max_filterd_cnts - 1e-6) & (p_cnts > min_seed_cnts))
 
-
     # merge with nearby 
     lut = np.zeros(p.shape[:-1], dtype=int)
     for index, seed in enumerate(np.stack(seeds, axis=-1)):
@@ -225,50 +309,44 @@ def get_mask(p, niter=5, *, min_seed_cnts=10):
     return mask
 
 
-def flow_to_mask(
-        dP, niter:int=200,
-        *,
-        threshold:float=0.,
-        max_flow_err:float=0.,
-        min_seed_cnts:int=10,
-    ) -> np.ndarray:
+def flow_to_mask(flow, *, niter=200, step_size=0.5, window_size=5, min_seed_cnts=30, expand_repeats=5, expand_min_cnts=2, max_flow_err=0):
     """ Convert flow field to mask.
     Args:
-        dP: flow field. 
-            Either batched input :(B, H, W, 2) or (B, D, H, W, 3)
-            or unbatched: (H, W, 2) or (D, H, W, 3)
+        flow: ([B,] H, W, 2) or ([B,] D, H, W, 3) flow field, can be batched or not batched.
+    Keyword Args:
         niter: number of iterations to follow the flow.
-        threshod: minimum flow magnitude to be considered foreground.
-        max_flow_err: maximum flow error to be considered valid (0: no filtering).
+        window_size: window size to get local maxima for seed points.
         min_seed_cnts: minimum number of pixels for a cell seed.
+        expand_repeats: number of iterations to expand the seed points.
+        expand_min_cnts: minimum number of pixels to expand the seed points.
     Returns:
-        mask: (B, H, W) or (B, D, H, W) for batched input. (H, W) 
-            or (D, H, W) for unbatched input
+        mask: ([B,] H, W) or ([B,] D, H, W) label mask
     """
-    D = dP.shape[-1]
-    ndim = dP.ndim
+    D = flow.shape[-1]
+    ndim = flow.ndim
 
     assert D == 2 or D == 3, f"flow field dimsion must be 2/3, got {D}"
 
     if ndim == D + 1: # unbatched
-        dP = dP[None]
+        flow = flow[None]
 
-    assert dP.ndim == D + 2, f"ilegal flow filed shape {dP.shape}"
+    assert flow.ndim == D + 2, f"ilegal flow filed shape {flow.shape}"
 
-    ps = jax.vmap(partial(follow_flows, niter=niter))(dP / 5)
-
-    mask = [ get_mask(p, min_seed_cnts=min_seed_cnts) for p in ps ]
+    mask = jax.vmap(partial(
+        _flow_to_mask, 
+        niter=niter,
+        step_size=step_size,
+        window_size=window_size,
+        min_seed_cnts=min_seed_cnts,
+        expand_repeats=expand_repeats,
+        expand_min_cnts=expand_min_cnts,
+    ))(flow)
 
     if max_flow_err > 0:
-        mask = [ correct_flow_err(f, m, max_flow_err) for f, m in zip(dP, mask) ]
+        mask = np.stack([ correct_flow_err(f, m, max_flow_err) for f, m in zip(flow, mask) ])
 
-    mask = np.stack(mask) if ndim == D + 2 else mask[0]
-
-    if threshold > 0:
-        from skimage.morphology import remove_small_holes
-        fg = (dP**2).sum(axis=-1) > threshold
-        fg = remove_small_holes(fg, area_threshold=64)
-        mask = np.where(fg, mask, 0)
+    if ndim == D + 1:
+        mask = mask.squeeze(0)
 
     return mask
 
