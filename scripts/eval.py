@@ -5,47 +5,65 @@ import pandas as pd
 from absl import app, flags
 from pathlib import Path
 from tqdm import tqdm
+from skimage.measure import regionprops
 from ctxseg.segmentation.flow import flow_to_mask
 from ctxseg.segmentation.utils import remove_small_instances, clean_up_mask
 from ctxseg.segmentation.metrics import LabelMetrics, MultiLabelMetrics
 
 flags.DEFINE_string("logpath", None, "dir for inference results", required=True)
 flags.DEFINE_string("dataset", None, "")
-flags.DEFINE_integer("niter", 1000, "")
+flags.DEFINE_integer("niter", 500, "")
 flags.DEFINE_float("threshold", 0.1, "")
 flags.DEFINE_float("maxflowerr", 0., "")
+flags.DEFINE_float("stepsize", 0.5, "")
 flags.DEFINE_integer("minsize", 100, "Min cell size")
+flags.DEFINE_float("scorethreshold", 0., "")
+flags.DEFINE_integer("nsamples", -1, "number of samples to analyze")
+flags.DEFINE_boolean('fast', False, "whether to recompute mask")
 
 FLAGS = flags.FLAGS
+
+def _get_mask(flow):
+    amptitude = np.sqrt((flow ** 2).sum(axis=-1, keepdims=True))
+    flow = np.where(amptitude > FLAGS.threshold, flow, 0)
+    # flow = np.where(amptitude > min_value, flow/amptitude, 0)
+    mask = flow_to_mask(flow, niter=FLAGS.niter, step_size=FLAGS.stepsize)
+    mask = np.stack([remove_small_instances(m, FLAGS.minsize) for m in mask])
+
+    return mask
 
 def _eval(dataset):
     metric = None
 
     root = Path(FLAGS.logpath)
-    params = dict(
-        niter=FLAGS.niter,
-        threshold=FLAGS.threshold,
-        max_flow_err=FLAGS.maxflowerr,
-    )
 
     ids = [fn.name.split("_label")[0] for fn in (root/dataset).glob("*_label*")]
 
     for img_n in tqdm(ids):
-        # img = tifffile.imread(root/dataset/f"{img_n}.tif")
         gt = tifffile.imread(root/dataset/f"{img_n}_label.tif")
-        pred = tifffile.imread(root/dataset/f"{img_n}_pred.tif")
-
         gt = remove_small_instances(gt, 100) # hack correct test dataset error
 
-        label = flow_to_mask(np.moveaxis(pred, 0, -1), **params)
+        out_file = root/dataset/f"{img_n}_output.tif"
+        if FLAGS.fast and out_file.exists():
+            label = tifffile.imread(out_file)
+        else:
+            pred = tifffile.imread(root/dataset/f"{img_n}_pred.tif") 
+            pred = np.moveaxis(pred, 0, -1)
+            label = _get_mask(pred)
 
-        # optionally remove small cells
-        label = np.stack([
-            clean_up_mask(remove_small_instances(x, FLAGS.minsize))
-            for x in label
-        ])
-
-        tifffile.imwrite(root/dataset/f"{img_n}_output.tif", label.astype("uint16"))
+            tifffile.imwrite(root/dataset/f"{img_n}_output.tif", label.astype("uint16"))
+        
+            if FLAGS.scorethreshold > 0:
+                new_labels = []
+                for pred_i, label_i in zip(pred, label):
+                    score_img = (pred_i ** 2).sum(axis=-1)
+                    label_i = clean_up_mask(label_i).astype(int)
+                    props = regionprops(label_i, intensity_image=score_img)
+                    scores = np.array([p.mean_intensity for p in props])
+                    lut = np.arange(label_i.max() + 1, dtype=int)
+                    lut[1:] = np.where(scores >= FLAGS.scorethreshold, lut[1:], 0)
+                    new_labels.append(lut[label_i])
+                label = np.stack(new_labels)
 
         if metric is None:
             metric = MultiLabelMetrics(label.shape[0])
@@ -60,7 +78,7 @@ def _keep_max(metric, micro_results):
     idx = micro_results.groupby(['image_id'])['instance_dice'].idxmax()
     sid = micro_results.loc[idx].set_index('image_id')['sample']
     sid = dict(sid)
-    
+
     mm = LabelMetrics()
     for k, sample_id in enumerate(metric.sample_ids):
         sample_n = sid[sample_id]
@@ -107,6 +125,7 @@ def main(_):
         else:
             import warnings
             warnings.warn(f"{ds_name} contains no data")
+
 
 if __name__ == "__main__":
     app.run(main)

@@ -1,15 +1,19 @@
 import numpy as np
 
-def remove_small_instances(mask, min_area=0):
+def remove_small_instances(mask, min_area=0, clean_up=True):
     """ remove all instances smaller than min_area"""
-    unique_ids, counts = np.unique(mask, return_counts=True)
-    small_ids = unique_ids[counts < min_area]
+    if min_area > 0:
+        unique_ids, counts = np.unique(mask, return_counts=True)
+        small_ids = unique_ids[counts < min_area]
 
-    mask = np.where(
-        np.isin(mask, small_ids),
-        0,
-        mask,
-    )
+        mask = np.where(
+            np.isin(mask, small_ids),
+            0,
+            mask,
+        )
+
+        if clean_up:
+            mask = clean_up_mask(mask)
     
     return mask
 
