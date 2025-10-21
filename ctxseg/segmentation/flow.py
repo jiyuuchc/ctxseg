@@ -165,11 +165,10 @@ def _follow_flows(dP, niter=200):
 
 
 def _count_flow(p):
-    img_shape = jnp.array(p.shape[:-1])
     p = p.astype('uint32')
 
     cnts = (
-        jnp.zeros(img_shape, dtype='uint32')
+        jnp.zeros(p.shape[:-1], dtype='uint32')
         .at[tuple(jnp.moveaxis(p, -1, 0))]
         .add(1)
     )
